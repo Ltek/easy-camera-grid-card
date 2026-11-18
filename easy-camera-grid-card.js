@@ -1,5 +1,5 @@
 // Easy Camera Grid Card (Ltek) — Home Assistant Dashboard card: one large live camera + a grid of snapshots
-// Version: v2026.11.18.1
+// Version: v2026.11.18.2
 //
 // One camera plays live in the large pane (Home Assistant's own ha-camera-stream: WebRTC, HLS or MJPEG,
 // whatever the camera offers). Every other camera is a tile in the grid. A tile is a JPEG snapshot from
@@ -17,7 +17,7 @@
 // Vanilla JS, single file. The card stylesheet is a constant (no config values are interpolated into
 // it); per-card values are custom properties set inline on the card root. Names are escaped.
 
-const BUILD_NUMBER = 'v2026.11.18.1';
+const BUILD_NUMBER = 'v2026.11.18.2';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'easy-camera-grid-card';
 const EDITOR_TAG = 'easy-camera-grid-card-editor';
@@ -111,6 +111,8 @@ function layoutFor(cfg, orientation, tileCount) {
 const resolveOrientation = (cfg, portraitScreen) =>
   (cfg.orientation === 'auto' ? (portraitScreen ? 'portrait' : 'landscape') : cfg.orientation);
 
+const isUnavailable = (st) => !st || st.state === 'unavailable' || st.state === 'unknown';
+
 /** Snapshot URL for a camera state at a pixel size, with a cache-buster. null when there is none. */
 function snapshotUrl(hass, stateObj, width, height, now = Date.now()) {
   const pic = stateObj?.attributes?.entity_picture;
@@ -121,8 +123,14 @@ function snapshotUrl(hass, stateObj, width, height, now = Date.now()) {
   return hass && typeof hass.hassUrl === 'function' ? hass.hassUrl(url) : url;
 }
 
+/** Text over a tile: missing entity, unavailable camera, or a snapshot that failed. '' = none. */
+function tileMessage(st, entity, failed) {
+  if (!st) return `${entity} not found`;
+  if (isUnavailable(st)) return 'Unavailable';
+  return failed ? 'No picture' : '';
+}
+
 const camName = (hass, cam) => cam.name || hass?.states?.[cam.entity]?.attributes?.friendly_name || cam.entity;
-const isUnavailable = (st) => !st || st.state === 'unavailable' || st.state === 'unknown';
 
 /** Make sure HA's lazy-loaded ha-camera-stream element is defined (it loads with the picture-entity card). */
 let streamReady = null;
@@ -281,7 +289,7 @@ class EasyCameraGridCard extends HTMLElement {
     el.style.setProperty('--fit', s.fit);
     el.innerHTML = `${s.mode === 'snapshot' ? '<img alt="" decoding="async">' : ''}<div class="msg"></div>${
       this._config.show_names ? '<div class="label"></div>' : ''}`;
-    const t = { cam, el, img: el.querySelector('img'), msg: el.querySelector('.msg'), timer: null, busy: false, mode: s.mode, refresh: s.refresh, stream: null };
+    const t = { cam, el, img: el.querySelector('img'), msg: el.querySelector('.msg'), timer: null, busy: false, mode: s.mode, refresh: s.refresh, stream: null, failed: false };
     this._paintTile(t);
     return t;
   }
@@ -293,8 +301,7 @@ class EasyCameraGridCard extends HTMLElement {
     t.el.setAttribute('aria-label', `Show ${name} live`);
     const label = t.el.querySelector('.label');
     if (label) label.textContent = name;
-    const down = isUnavailable(st);
-    t.msg.textContent = !st ? `${t.cam.entity} not found` : (down ? 'Unavailable' : '');
+    t.msg.textContent = tileMessage(st, t.cam.entity, t.failed);
     t.msg.style.display = t.msg.textContent ? '' : 'none';
   }
 
@@ -423,9 +430,17 @@ class EasyCameraGridCard extends HTMLElement {
     if (!url) { next(); return; }
     t.busy = true;
     const pre = new Image();
-    pre.onload = () => { t.img.src = url; next(); };
-    pre.onerror = () => next();
+    pre.onload = () => { t.img.src = url; this._setFailed(t, false); next(); };
+    pre.onerror = () => { this._setFailed(t, true); next(); };
     pre.src = url;
+  }
+
+  /** A snapshot that won't load says so on the tile (and keeps retrying), instead of staying blank. */
+  _setFailed(t, failed) {
+    if (t.failed === failed) return;
+    t.failed = failed;
+    if (failed && t.img) t.img.removeAttribute('src');
+    this._paintTile(t);
   }
 
   _tileStream(t, on) {
@@ -623,7 +638,7 @@ class EasyCameraGridCardEditor extends HTMLElement {
 // Test hooks (pure helpers; no effect in the browser)
 EasyCameraGridCard._test = {
   BUILD_NUMBER, VERSION, DEFAULTS, CARD_CSS, normalizeConfig, tileSettings, gridCameras, layoutFor,
-  resolveOrientation, snapshotUrl, camName, ensureStreamElement,
+  resolveOrientation, snapshotUrl, camName, ensureStreamElement, tileMessage,
 };
 
 if (!customElements.get(CARD_TAG)) customElements.define(CARD_TAG, EasyCameraGridCard);

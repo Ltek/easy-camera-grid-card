@@ -1,5 +1,11 @@
 # Changelog
 
+## v2026.11.18.2
+
+- A tile whose snapshot doesn't load now says **No picture** instead of staying blank, and keeps trying at its
+  refresh interval. The message goes away as soon as a picture loads. (Blank tiles were Blue Iris snapshots
+  that came back as a login page; Blue Iris (Ltek) 2026.11.18.47 fixes that side.)
+
 ## v2026.11.18.1
 
 - First build. One camera plays live in a large pane; every other camera is a JPEG snapshot tile, refreshed
