@@ -1,0 +1,6 @@
+archive/
+past/
+*.zip
+.DS_Store
+HANDOFF*.md
+node_modules/
