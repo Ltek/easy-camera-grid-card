@@ -1,5 +1,5 @@
 // Easy Camera Grid Card (Ltek) — Home Assistant Dashboard card: one large live camera + a grid of snapshots
-// Version: v2026.11.18.2
+// Version: v2026.11.18.3
 //
 // One camera plays live in the large pane (Home Assistant's own ha-camera-stream: WebRTC, HLS or MJPEG,
 // whatever the camera offers). Every other camera is a tile in the grid. A tile is a JPEG snapshot from
@@ -17,7 +17,7 @@
 // Vanilla JS, single file. The card stylesheet is a constant (no config values are interpolated into
 // it); per-card values are custom properties set inline on the card root. Names are escaped.
 
-const BUILD_NUMBER = 'v2026.11.18.2';
+const BUILD_NUMBER = 'v2026.11.18.3';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'easy-camera-grid-card';
 const EDITOR_TAG = 'easy-camera-grid-card-editor';
@@ -44,6 +44,15 @@ const DEFAULTS = {
   portrait: { main_position: 'top', main_size: 45, columns: 3, rows: 0 },
 };
 const POSITIONS = { landscape: ['left', 'right'], portrait: ['top', 'bottom'] };
+
+// View state outside the element: the dashboard editor replaces the card element on many edits, and the
+// camera you tapped should still be the live one afterwards. Keyed by the camera list.
+const VIEW = new Map();
+const viewKey = (cfg) => cfg.cameras.map((c) => c.entity).join('|');
+
+// Config keys whose change needs the tiles rebuilt; anything else is patched in place.
+const STRUCTURE_KEYS = ['cameras', 'tile_mode', 'show_names', 'muted', 'main_fit', 'show_main_name', 'main_camera'];
+const structureOf = (cfg) => JSON.stringify(STRUCTURE_KEYS.map((k) => cfg[k]));
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const clamp = (v, lo, hi, d) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
@@ -209,11 +218,26 @@ class EasyCameraGridCard extends HTMLElement {
     if (!config || !Array.isArray(config.cameras) || !config.cameras.length) throw new Error('Add at least one camera under cameras:');
     const cfg = normalizeConfig(config);
     if (!cfg.cameras.length) throw new Error('Every camera needs an entity, like camera.front_door');
-    const changed = JSON.stringify(cfg) !== JSON.stringify(this._config);
+    const prev = this._config;
+    if (prev && JSON.stringify(cfg) === JSON.stringify(prev)) return;
     this._config = cfg;
-    if (!changed) return;
-    this._mainId = cfg.main_camera;
+    if (prev && this._root && structureOf(prev) === structureOf(cfg)) { this._patch(); return; }
+    const v = VIEW.get(viewKey(cfg));
+    this._mainId = v && v.start === cfg.main_camera && cfg.cameras.some((c) => c.entity === v.main) ? v.main : cfg.main_camera;
     if (this._hass) this._build();
+  }
+
+  /** Layout, refresh, fit or go-back changed: update what's there, keep the stream and the tiles. */
+  _patch() {
+    const cfg = this._config;
+    this._root.style.setProperty('--ecg-gap', `${cfg.gap}px`);
+    for (const t of this._tiles.values()) {
+      const s = tileSettings(cfg, t.cam = cfg.cameras.find((c) => c.entity === t.cam.entity) || t.cam);
+      t.el.style.setProperty('--fit', s.fit);
+      if (s.refresh !== t.refresh) { t.refresh = s.refresh; if (t.timer) this._loadSnapshot(t); }
+    }
+    this._applyLayout();
+    this._armReset();
   }
 
   set hass(hass) {
@@ -345,6 +369,7 @@ class EasyCameraGridCard extends HTMLElement {
   promote(entity) {
     if (!entity || entity === this._mainId || !this._tiles.has(entity)) return;
     this._mainId = entity;
+    VIEW.set(viewKey(this._config), { main: entity, start: this._config.main_camera });
     this._placeTiles();
     for (const t of this._tiles.values()) {
       const inGrid = t.cam.entity !== entity;
@@ -471,48 +496,189 @@ class EasyCameraGridCard extends HTMLElement {
 }
 
 // =================================================================== editor
+// Follows CARD_DESIGN_SYSTEM.md: --ltek-* token block (byte-identical to the other Ltek cards), top-level
+// panels with an accent border when open, flat uppercase sub-panels, content-width label rows, sliders with
+// a bold readout, trash icon for delete, Star + Report footer. Rendered in the light DOM like the other cards.
 const EDITOR_CSS = `
-:host { display: block; }
-details { border: 1px solid var(--divider-color, #ccc); border-radius: 8px; margin: 8px 0; }
-summary { padding: 10px 12px; cursor: pointer; font-weight: 500; display: flex; gap: 8px; align-items: center; }
-.body { padding: 4px 12px 12px; }
-.row { display: flex; gap: 8px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
-.row > label.lbl { min-width: 150px; color: var(--secondary-text-color); }
-input[type=text], input[type=number], select { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--divider-color, #ccc);
-  background: var(--card-background-color, #fff); color: var(--primary-text-color); font: inherit; }
-input[type=number] { width: 80px; }
-.cam { border: 1px solid var(--divider-color, #ccc); border-radius: 8px; padding: 8px; margin: 6px 0; }
-.cam .head { display: flex; gap: 6px; align-items: center; }
-.cam .head input { flex: 1; min-width: 0; }
-button { cursor: pointer; border: 1px solid var(--divider-color, #ccc); border-radius: 6px; background: transparent;
-  color: var(--primary-text-color); padding: 4px 8px; font: inherit; }
-button:disabled { opacity: .35; cursor: default; }
-.muted { color: var(--secondary-text-color); font-size: 12px; }
-.foot { margin-top: 12px; font-size: 12px; color: var(--secondary-text-color); display: flex; gap: 12px; flex-wrap: wrap; }
-.foot a { color: var(--primary-color); }
+        .ecge {
+          /* Font sizes (by role, not by pixel) */
+          --ltek-fs-panel-title: 16px;  /* top-level panel / section title */
+          --ltek-fs-header: 15px;       /* editor header, panel summary */
+          --ltek-fs-group: 14px;        /* group heading inside a panel */
+          --ltek-fs-label: 13px;        /* standard field label / row */
+          --ltek-fs-body: 12px;         /* body text, most controls */
+          --ltek-fs-small: 11px;        /* hints, secondary text */
+          --ltek-fs-tiny: 10px;         /* badges, micro-labels */
+          /* Font weights */
+          --ltek-fw-normal: 400;        /* control labels (recede) */
+          --ltek-fw-medium: 500;
+          --ltek-fw-semibold: 600;
+          --ltek-fw-bold: 700;          /* titles, values (lead) */
+          /* Text colors */
+          --ltek-c-text: var(--primary-text-color, #e1e1e1);  /* primary */
+          --ltek-c-label: #ccc;         /* control labels */
+          --ltek-c-muted: #888;         /* hints / disabled */
+          --ltek-c-accent: var(--primary-color, #2196F3);
+          /* Accent tints — hover / active fills (kept as rgba literals; one place
+             to change). Default to the Material blue the cards shipped with. */
+          --ltek-c-accent-fade: rgba(var(--rgb-primary-color,33,150,243),0.12);       /* active / pressed fill */
+          --ltek-c-accent-fade-soft: rgba(var(--rgb-primary-color,33,150,243),0.08);  /* hover fill */
+          --ltek-c-error-fade: rgba(244,67,54,0.15);         /* delete hover fill */
+          /* Status colors — defer to the user's theme, fall back to Material. */
+          --ltek-c-error: var(--error-color, #f44336);
+          --ltek-c-success: var(--success-color, #4caf50);
+          --ltek-c-warning: var(--warning-color, #ffb300);
+          --ltek-c-info: var(--info-color, #2196F3);
+          /* Second accent: the green "library / shared" grouping (distinct from
+             the blue layout accent on purpose — NOT tied to --primary-color). */
+          --ltek-c-accent-lib: #7fd18a;
+          --ltek-c-on-accent: #fff;   /* text/icon on a solid accent fill */
+          /* Action icons (edit/copy/hide/etc): neutral idle → brighten on hover.
+             Delete stays a status color (error) on its own hover. */
+          --ltek-c-icon: #aaa;        /* idle action icon */
+          --ltek-c-icon-hover: #fff;  /* hovered action icon */
+          /* Surfaces */
+          --ltek-c-surface: rgba(255,255,255,0.015);        /* panels */
+          --ltek-c-surface-raised: rgba(255,255,255,0.02);  /* cards / rows */
+          /* Borders */
+          --ltek-c-panel-border: #3a3a3a;   /* panels */
+          --ltek-c-border: #444;            /* controls */
+          --ltek-c-border-soft: #333;       /* subtle inner dividers */
+          /* Radii */
+          --ltek-r-panel: 12px;   /* panels */
+          --ltek-r-card: 10px;    /* section cards */
+          --ltek-r-md: 8px;       /* blocks */
+          --ltek-r-ctrl: 6px;     /* inputs, selects, buttons */
+          /* Spacing scale (4px base) */
+          --ltek-sp-1: 4px;
+          --ltek-sp-2: 6px;
+          --ltek-sp-3: 8px;
+          --ltek-sp-4: 10px;
+          --ltek-sp-5: 12px;
+          --ltek-sp-6: 16px;
+          /* Control padding — uniform input/select/button height. */
+          --ltek-ctrl-pad: 6px 10px;
+          /* Icon sizes (two clear roles; one-off glyphs stay literal). */
+          --ltek-icon-sm: 16px;   /* inline / action icons */
+          --ltek-icon-lg: 20px;   /* panel-title icons */
+          /* Slider row geometry (shared by every slider) */
+          --ltek-slider-val-w: 44px;   /* value readout column width */
+          display: flex; flex-direction: column; gap: 8px; font-family: var(--paper-font-body1_-_font-family, sans-serif);
+        }
+        .ecge ha-icon { --mdc-icon-size: 18px; vertical-align: middle; }
+        .ecge-sec { border: 1px solid var(--ltek-c-panel-border); border-radius: var(--ltek-r-panel); background: var(--ltek-c-surface); overflow: hidden; }
+        .ecge-sec[open] { border-color: var(--ltek-c-accent); }
+        .ecge-sec > summary { display: flex; align-items: center; gap: var(--ltek-sp-3); padding: 14px 16px; cursor: pointer; user-select: none;
+          list-style: none; font-size: var(--ltek-fs-panel-title); font-weight: var(--ltek-fw-bold); color: var(--ltek-c-text); }
+        .ecge-sec > summary::-webkit-details-marker, .ecge-sub > summary::-webkit-details-marker { display: none; }
+        .ecge-sec > summary > ha-icon:not(.chev) { color: var(--ltek-c-accent); --mdc-icon-size: var(--ltek-icon-lg); }
+        .ecge-sec > summary .chev, .ecge-sub > summary .chev { margin-left: auto; color: #999; --mdc-icon-size: 20px; transition: transform .2s ease; transform: rotate(-90deg); }
+        .ecge-sec[open] > summary .chev, .ecge-sub[open] > summary .chev { transform: none; }
+        .ecge-body { padding: 0 16px 16px; }
+        .ecge-hint { color: var(--ltek-c-muted); font-size: var(--ltek-fs-small); margin: 0 0 var(--ltek-sp-3); }
+        .ecge-hint code { font-size: var(--ltek-fs-tiny); }
+        .ecge-group { color: var(--accent-color, var(--ltek-c-accent)); font-size: var(--ltek-fs-group); font-weight: var(--ltek-fw-semibold);
+          margin-top: var(--ltek-sp-4); padding-top: var(--ltek-sp-3); border-top: 1px solid var(--ltek-c-border-soft); }
+        .ecge-group.first { margin-top: 0; padding-top: 0; border-top: none; }
+        .ecge-sub { border-top: 1px solid var(--ltek-c-border-soft); border-radius: var(--ltek-r-ctrl); }
+        .ecge-sub[open] { border: 1px solid var(--accent-color, var(--ltek-c-accent)); margin: var(--ltek-sp-1) 0; }
+        .ecge-sub > summary { display: flex; align-items: center; gap: var(--ltek-sp-2); padding: var(--ltek-sp-3) var(--ltek-sp-2); cursor: pointer;
+          list-style: none; color: var(--ltek-c-accent); font-size: var(--ltek-fs-label); font-weight: var(--ltek-fw-semibold);
+          text-transform: uppercase; letter-spacing: 0.04em; }
+        .ecge-sub-body { padding: 0 var(--ltek-sp-4) var(--ltek-sp-4); }
+        .ecge-row { display: flex; align-items: center; gap: var(--ltek-sp-4); padding: var(--ltek-sp-1) 0; flex-wrap: wrap; justify-content: flex-start; }
+        .ecge-row label.lbl { color: var(--ltek-c-label); font-size: var(--ltek-fs-body); font-weight: var(--ltek-fw-normal); flex: none; }
+        .ecge-row input[type="text"], .ecge-row select { flex: 1 1 auto; min-width: 0; padding: var(--ltek-ctrl-pad);
+          background: var(--secondary-background-color, #2a2a2a); border: 1px solid var(--ltek-c-border); border-radius: var(--ltek-r-ctrl);
+          color: var(--ltek-c-text); font-size: var(--ltek-fs-body); }
+        .ecge-row input[type="range"] { flex: 1 1 auto; min-width: 100px; accent-color: var(--ltek-c-accent); cursor: pointer; }
+        .ecge-val { flex: 0 0 var(--ltek-slider-val-w); text-align: right; font-weight: var(--ltek-fw-bold); font-variant-numeric: tabular-nums;
+          white-space: nowrap; color: var(--ltek-c-text); font-size: var(--ltek-fs-body); }
+        .ecge-nowrap { flex-wrap: nowrap; }
+        .ecge-check { display: flex; align-items: center; gap: var(--ltek-sp-2); padding: var(--ltek-sp-1) 0; color: var(--ltek-c-label);
+          font-size: var(--ltek-fs-body); cursor: pointer; }
+        .ecge-check input { accent-color: var(--ltek-c-accent); }
+        .ecge-check .muted { color: var(--ltek-c-muted); font-size: var(--ltek-fs-small); }
+        .ecge-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 0 var(--ltek-sp-4); }
+        .ecge-color { display: flex; flex: 1 1 auto; gap: var(--ltek-sp-2); flex-wrap: wrap; min-width: 0; }
+        .ecge-color select.ecge-cmode { flex: 0 0 auto; min-width: 120px; }
+        .ecge-color input[type="color"] { flex: 0 0 auto; width: 44px; height: 30px; padding: 0; border: none; background: none; cursor: pointer; }
+        .ecge-reset { border: none; background: none; padding: 0; color: var(--ltek-c-icon); cursor: pointer; }
+        .ecge-reset:hover { color: var(--ltek-c-icon-hover); }
+        .ecge-reset ha-icon { --mdc-icon-size: var(--ltek-icon-sm); }
+        .ecge-list { display: flex; flex-direction: column; gap: var(--ltek-sp-2); }
+        .ecge-item { display: flex; align-items: center; gap: var(--ltek-sp-2); padding: var(--ltek-sp-2) var(--ltek-sp-3);
+          background: var(--ltek-c-surface-raised); border-radius: var(--ltek-r-card); }
+        .ecge-item input[type="text"] { flex: 1 1 0; min-width: 0; padding: var(--ltek-ctrl-pad); background: var(--secondary-background-color, #2a2a2a);
+          border: 1px solid var(--ltek-c-border); border-radius: var(--ltek-r-ctrl); color: var(--ltek-c-text); font-size: var(--ltek-fs-body); }
+        .ecge-item > ha-icon { color: var(--ltek-c-accent); --mdc-icon-size: var(--ltek-icon-lg); flex: none; }
+        .ecge-del { border: none; background: none; padding: 0; cursor: pointer; color: var(--ltek-c-icon); flex: none; line-height: 0; }
+        .ecge-del ha-icon { --mdc-icon-size: var(--ltek-icon-sm); }
+        .ecge-del:hover { color: var(--ltek-c-error); }
+        .ecge-add { align-self: flex-start; padding: var(--ltek-ctrl-pad); border: 1px dashed var(--ltek-c-accent); border-radius: var(--ltek-r-ctrl);
+          background: transparent; color: var(--ltek-c-accent); font-size: var(--ltek-fs-body); font-weight: var(--ltek-fw-semibold); cursor: pointer; }
+        .ecge-add:hover { background: var(--ltek-c-accent-fade-soft); }
+  .ecge-links { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--divider-color); }
+  .ecge-star { display: inline-flex; align-items: center; gap: 6px; font-size: .82rem; font-weight: 600; color: #fff; text-decoration: none; padding: 6px 18px; border-radius: 20px;
+    background: linear-gradient(90deg, #f7a92b 0%, #f4731a 100%); box-shadow: 0 2px 8px rgba(244,115,26,.35); }
+  .ecge-star:hover { filter: brightness(1.1); }
+  .ecge-issue { font-size: .78rem; color: var(--primary-color); text-decoration: none; padding: 4px 10px; border: 1px solid var(--primary-color); border-radius: 14px; }
+  .ecge-issue:hover { background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
+        .ecge-foot { color: var(--ltek-c-muted); font-size: var(--ltek-fs-tiny); text-align: right; }
+        .ecge-name { flex: 1 1 auto; min-width: 0; color: var(--ltek-c-text); font-size: var(--ltek-fs-label); font-weight: var(--ltek-fw-normal);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .ecge-badge { flex: none; color: var(--ltek-c-muted); font-size: var(--ltek-fs-tiny); font-variant-numeric: tabular-nums;
+          border: 1px solid var(--ltek-c-border); border-radius: var(--ltek-r-ctrl); padding: 0 var(--ltek-sp-1); }
+        .ecge-act { border: none; background: none; padding: 0; cursor: pointer; color: var(--ltek-c-icon); flex: none; line-height: 0; }
+        .ecge-act:hover { color: var(--ltek-c-icon-hover); }
+        .ecge-act.on { color: var(--ltek-c-accent); }
+        .ecge-act:disabled { opacity: .3; cursor: default; }
+        .ecge-act ha-icon { --mdc-icon-size: var(--ltek-icon-sm); }
+        .ecge-item.off .ecge-name, .ecge-item.off > ha-icon { opacity: .45; }
+        .ecge-warn { color: var(--ltek-c-warning); }
 `;
+const EXTRA_EDITOR_CSS = `
+        .ecge-cams { display: flex; flex-direction: column; gap: var(--ltek-sp-2); }
+        .ecge-cam { background: var(--ltek-c-surface-raised); border-radius: var(--ltek-r-card); border: 1px solid transparent; }
+        .ecge-cam.open { border-color: var(--accent-color, var(--ltek-c-accent)); }
+        .ecge-cam > .ecge-item { background: none; }
+        .ecge-cam-body { padding: 0 var(--ltek-sp-4) var(--ltek-sp-4); }
+        .ecge-sub-head { color: var(--ltek-c-accent); font-size: var(--ltek-fs-label); font-weight: var(--ltek-fw-semibold);
+          text-transform: uppercase; letter-spacing: 0.04em; }
+        .ecge-badge.live { color: var(--ltek-c-accent); border-color: var(--ltek-c-accent); }
+        .ecge-badge.start { color: var(--ltek-c-success); border-color: var(--ltek-c-success); }
+        .ecge-row input[type="text"].ecge-short { flex: 0 1 140px; }
+`;
+
+const ENTITY_LIST_ID = 'ecge-cameras';
+const FIT_OPTIONS = [['cover', 'Fill (crop the edges)'], ['contain', 'Whole picture'], ['fill', 'Stretch']];
 
 class EasyCameraGridCardEditor extends HTMLElement {
   constructor() {
     super();
-    this.attachShadow({ mode: 'open' });
     this._config = {};
     this._open = new Set(['cameras']);
+    this._openCam = new Set();
   }
 
   setConfig(config) {
-    const changed = JSON.stringify(config) !== JSON.stringify(this._config);
-    this._config = JSON.parse(JSON.stringify(config || {}));
-    if (changed || !this._rendered) this._render();
+    const next = JSON.parse(JSON.stringify(config || {}));
+    const changed = JSON.stringify(next) !== JSON.stringify(this._config);
+    this._config = next;
+    if (!this._rendered || changed) this._render();
   }
 
-  set hass(hass) { const first = !this._hass; this._hass = hass; if (first) this._render(); }
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) this._render();
+  }
 
   _emit() {
     this.dispatchEvent(new CustomEvent('config-changed', { detail: { config: this._config }, bubbles: true, composed: true }));
   }
 
-  /** Set a top-level or nested (landscape.columns) key; '' / default removes it. */
+  /** Write a top-level or nested (landscape.columns) key; '' or the default removes it (byte-stable YAML). */
   _set(path, value) {
     const [a, b] = path.split('.');
     if (b) {
@@ -524,121 +690,267 @@ class EasyCameraGridCardEditor extends HTMLElement {
     this._emit();
   }
 
-  _cams() { return (this._config.cameras || []).map((x) => (typeof x === 'string' ? { entity: x } : { ...x })); }
-
-  _setCams(list) {
-    this._config.cameras = list.map((c) => {
-      const keys = Object.keys(c).filter((k) => c[k] !== '' && c[k] !== undefined);
-      return keys.length === 1 && keys[0] === 'entity' ? c.entity : Object.fromEntries(keys.map((k) => [k, c[k]]));
-    });
-    this._emit();
-    this._render();
-  }
-
   _val(path) {
     const n = normalizeConfig(this._config);
     const [a, b] = path.split('.');
     return b ? n[a][b] : n[a];
   }
 
-  _sel(path, label, opts) {
+  _isSet(path) {
+    const [a, b] = path.split('.');
+    return b ? !!this._config[a] && this._config[a][b] !== undefined : this._config[a] !== undefined;
+  }
+
+  _cams() { return (this._config.cameras || []).map((x) => (typeof x === 'string' ? { entity: x } : { ...x })); }
+
+  /** Cameras back to the config: a camera with only an entity is written as a plain string. */
+  _saveCams(list) {
+    this._config.cameras = list.map((c) => {
+      const keys = Object.keys(c).filter((k) => c[k] !== '' && c[k] !== undefined && c[k] !== null);
+      return keys.length === 1 && keys[0] === 'entity' ? c.entity : Object.fromEntries(keys.map((k) => [k, c[k]]));
+    });
+    this._emit();
+    this._render();
+  }
+
+  // ------------------------------------------------------------ building blocks
+  _panel(id, icon, title, body) {
+    return `<details class="ecge-sec" data-panel="${id}"${this._open.has(id) ? ' open' : ''}>
+      <summary><ha-icon icon="${icon}"></ha-icon>${title}<ha-icon class="chev" icon="mdi:chevron-down"></ha-icon></summary>
+      <div class="ecge-body">${body}</div></details>`;
+  }
+
+  _sub(id, title, body) {
+    return `<details class="ecge-sub" data-panel="${id}"${this._open.has(id) ? ' open' : ''}>
+      <summary>${title}<ha-icon class="chev" icon="mdi:chevron-down"></ha-icon></summary>
+      <div class="ecge-sub-body">${body}</div></details>`;
+  }
+
+  _hint(text) { return `<p class="ecge-hint">${text}</p>`; }
+
+  _group(label, first = false) { return `<div class="ecge-group${first ? ' first' : ''}">${label}</div>`; }
+
+  _select(path, label, options, attr = 'data-path') {
     const cur = String(this._val(path));
-    return `<div class="row"><label class="lbl">${label}</label><select data-path="${path}">${
-      opts.map(([v, n]) => `<option value="${esc(v)}"${String(v) === cur ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></div>`;
+    return `<div class="ecge-row"><label class="lbl">${label}</label><select ${attr}="${path}">${
+      options.map(([v, n]) => `<option value="${esc(v)}"${String(v) === cur ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></div>`;
   }
 
-  _num(path, label, min, max, step = 1, hint = '') {
-    return `<div class="row"><label class="lbl">${label}</label><input type="number" data-path="${path}" data-num="1" min="${min}" max="${max}" step="${step}" value="${esc(this._val(path))}">${
-      hint ? `<span class="muted">${hint}</span>` : ''}</div>`;
+  _check(path, label, hint = '') {
+    return `<label class="ecge-check"><input type="checkbox" data-bool="${path}"${this._val(path) ? ' checked' : ''}>${label}${
+      hint ? ` <span class="muted">${hint}</span>` : ''}</label>`;
   }
 
-  _chk(path, label) {
-    return `<div class="row"><label><input type="checkbox" data-path="${path}" data-bool="1"${this._val(path) ? ' checked' : ''}> ${label}</label></div>`;
+  /** Label, range, bold readout and ↺ when set: one row that never wraps. */
+  _slider(path, label, min, max, step, fmt) {
+    const v = Number(this._val(path));
+    return `<div class="ecge-row ecge-nowrap"><label class="lbl">${label}</label>
+      <input type="range" data-slider="${path}" min="${min}" max="${max}" step="${step}" value="${v}">
+      <span class="ecge-val" data-val="${path}">${fmt(v)}</span>
+      ${this._isSet(path) ? `<button class="ecge-reset" data-reset="${path}" title="Back to default"><ha-icon icon="mdi:restore"></ha-icon></button>` : ''}</div>`;
   }
 
-  _panel(id, title, body) {
-    return `<details data-panel="${id}"${this._open.has(id) ? ' open' : ''}><summary>${title}</summary><div class="body">${body}</div></details>`;
+  // ------------------------------------------------------------ panels
+  _camerasBody() {
+    const cams = this._cams();
+    const start = this._val('main_camera');
+    const rows = cams.map((c, i) => {
+      const open = this._openCam.has(i);
+      const mode = c.tile_mode || this._val('tile_mode');
+      const badges = `${c.entity === start ? '<span class="ecge-badge start">Start</span>' : ''}${
+        mode === 'live' ? '<span class="ecge-badge live">Live tile</span>' : ''}`;
+      const refreshOwn = c.refresh_seconds !== undefined;
+      const body = open ? `<div class="ecge-cam-body">
+          <div class="ecge-row"><label class="lbl">Camera</label><input type="text" data-cam="${i}" data-field="entity" list="${ENTITY_LIST_ID}"
+            value="${esc(c.entity)}" placeholder="camera.front_door"></div>
+          <div class="ecge-row"><label class="lbl">Name</label><input type="text" data-cam="${i}" data-field="name" value="${esc(c.name || '')}"
+            placeholder="${esc(camName(this._hass, { entity: c.entity }))}"></div>
+          <div class="ecge-row"><label class="lbl">Tile</label><select data-cam="${i}" data-field="tile_mode">${
+            [['', `Card default (${this._val('tile_mode') === 'live' ? 'live stream' : 'snapshot'})`], ['snapshot', 'Snapshot'], ['live', 'Live stream']]
+              .map(([v, n]) => `<option value="${v}"${(c.tile_mode || '') === v ? ' selected' : ''}>${n}</option>`).join('')}</select></div>
+          ${mode === 'snapshot' ? `<div class="ecge-row ecge-nowrap"><label class="ecge-check"><input type="checkbox" data-cam-refresh="${i}"${refreshOwn ? ' checked' : ''}>Own refresh</label>
+            ${refreshOwn ? `<input type="range" data-cam="${i}" data-field="refresh_seconds" min="0.5" max="60" step="0.5" value="${c.refresh_seconds}">
+            <span class="ecge-val" data-cam-val="${i}">${fmtSecs(c.refresh_seconds)}</span>`
+    : `<span class="muted">${fmtSecs(this._val('refresh_seconds'))} (card default)</span>`}</div>` : ''}
+          <div class="ecge-row"><label class="lbl">Fit</label><select data-cam="${i}" data-field="fit">${
+            [['', `Card default (${FIT_OPTIONS.find(([v]) => v === this._val('tile_fit'))[1].toLowerCase()})`], ...FIT_OPTIONS]
+              .map(([v, n]) => `<option value="${v}"${(c.fit || '') === v ? ' selected' : ''}>${n}</option>`).join('')}</select></div>
+        </div>` : '';
+      return `<div class="ecge-cam${open ? ' open' : ''}">
+        <div class="ecge-item"><ha-icon icon="mdi:cctv"></ha-icon>
+          <span class="ecge-name">${esc(camName(this._hass, c))}</span>${badges}
+          <button class="ecge-act" data-move="${i}" data-dir="-1" title="Move up"${i === 0 ? ' disabled' : ''}><ha-icon icon="mdi:arrow-up"></ha-icon></button>
+          <button class="ecge-act" data-move="${i}" data-dir="1" title="Move down"${i === cams.length - 1 ? ' disabled' : ''}><ha-icon icon="mdi:arrow-down"></ha-icon></button>
+          <button class="ecge-act${open ? ' on' : ''}" data-edit="${i}" title="${open ? 'Done' : 'Edit'}"><ha-icon icon="mdi:pencil"></ha-icon></button>
+          <button class="ecge-del" data-del="${i}" title="Remove"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button></div>
+        ${body}</div>`;
+    }).join('');
+    return `${this._hint('The grid shows the cameras in this order. Tap ✏️ to give one camera its own name or tile settings.')}
+      <div class="ecge-cams"><button class="ecge-add" data-add="1">+ Camera</button>${rows}</div>
+      ${this._group('Start camera')}
+      ${this._hint('Shown live in the large pane when the card opens, and where “Go back” returns to.')}
+      ${this._select('main_camera', 'Starts live', cams.map((c) => [c.entity, camName(this._hass, c)]))}`;
+  }
+
+  _tilesBody() {
+    const snap = this._val('tile_mode') === 'snapshot';
+    return `${this._hint('Defaults for every tile. A camera can change these for itself in Cameras.')}
+      ${this._group('Picture', true)}
+      ${this._select('tile_mode', 'Tile shows', [['snapshot', 'Snapshot (JPEG)'], ['live', 'Live stream']])}
+      ${snap ? this._slider('refresh_seconds', 'Refresh every', 0.5, 30, 0.5, fmtSecs) : this._hint('Every tile streaming live uses much more of the tablet than snapshots.')}
+      ${this._select('tile_fit', 'Fit', FIT_OPTIONS)}
+      ${this._group('Label')}
+      ${this._check('show_names', 'Show the camera name')}`;
+  }
+
+  _mainBody() {
+    const reset = Number(this._val('reset_after')) > 0;
+    return `${this._hint('The camera you tapped plays here, live.')}
+      ${this._group('Picture', true)}
+      ${this._select('main_fit', 'Fit', FIT_OPTIONS)}
+      ${this._check('muted', 'Muted')}
+      ${this._check('show_main_name', 'Show the name and LIVE badge')}
+      ${this._group('Go back')}
+      <div class="ecge-row ecge-nowrap"><label class="ecge-check"><input type="checkbox" data-reset-on="1"${reset ? ' checked' : ''}>Back to the start camera after</label>
+        ${reset ? `<input type="range" data-slider="reset_after" min="10" max="900" step="10" value="${this._val('reset_after')}">
+        <span class="ecge-val" data-val="reset_after">${fmtSecs(this._val('reset_after'))}</span>` : ''}</div>
+      ${this._hint('Counted from the last touch on the card.')}`;
+  }
+
+  _layoutBody() {
+    const fill = this._val('height') === 'fill';
+    const count = (n) => String(n);
+    const one = (o, positions) => this._sub(`layout-${o}`, o === 'landscape' ? 'Landscape' : 'Portrait',
+      `${this._select(`${o}.main_position`, 'Large pane', positions)}
+      ${this._slider(`${o}.main_size`, 'Large pane size', 20, 90, 1, (n) => `${n}%`)}
+      ${this._slider(`${o}.columns`, 'Grid columns', 1, 8, 1, count)}
+      ${this._slider(`${o}.rows`, 'Grid rows', 0, 8, 1, (n) => (n ? String(n) : 'Auto'))}`);
+    return `${this._hint('Landscape and portrait each have their own layout. With “Follow the screen” the card switches when the tablet turns.')}
+      ${this._group('Screen', true)}
+      ${this._select('orientation', 'Orientation', [['auto', 'Follow the screen'], ['landscape', 'Always landscape'], ['portrait', 'Always portrait']])}
+      <div class="ecge-row"><label class="lbl">Height</label><select data-height-mode="1">
+        <option value="fill"${fill ? ' selected' : ''}>Fill the rest of the screen</option>
+        <option value="fixed"${fill ? '' : ' selected'}>Fixed height</option></select>
+        ${fill ? '' : `<input type="text" class="ecge-short" data-path="height" value="${esc(this._val('height'))}" placeholder="600px or 70vh">`}</div>
+      ${this._slider('gap', 'Gap', 0, 24, 1, (n) => `${n}px`)}
+      ${this._group('Layouts')}
+      ${one('landscape', [['left', 'Left'], ['right', 'Right']])}
+      ${one('portrait', [['top', 'Top'], ['bottom', 'Bottom']])}
+      ${this._hint('Rows “Auto” fits every tile; a set number of rows scrolls the grid when there are more tiles.')}`;
   }
 
   _render() {
-    this._rendered = true;
-    const cams = this._cams();
+    const ae = document.activeElement && this.contains(document.activeElement) ? document.activeElement : null;
+    const focusSel = ae ? (ae.dataset.cam !== undefined ? `[data-cam="${ae.dataset.cam}"][data-field="${ae.dataset.field}"]`
+      : ae.dataset.path ? `[data-path="${ae.dataset.path}"]` : null) : null;
     const camIds = Object.keys(this._hass?.states || {}).filter((id) => id.startsWith('camera.')).sort();
-    const nameOf = (c) => camName(this._hass, c);
-    const camRows = cams.map((c, i) => `<div class="cam" data-i="${i}">
-      <div class="head"><input type="text" data-cam="${i}" data-field="entity" list="ecg-cams" value="${esc(c.entity)}" placeholder="camera.front_door">
-        <button data-move="${i}" data-dir="-1" title="Move up"${i === 0 ? ' disabled' : ''}>▲</button>
-        <button data-move="${i}" data-dir="1" title="Move down"${i === cams.length - 1 ? ' disabled' : ''}>▼</button>
-        <button data-del="${i}" title="Remove">✕</button></div>
-      <div class="row"><label class="lbl">Name</label><input type="text" data-cam="${i}" data-field="name" value="${esc(c.name || '')}" placeholder="${esc(nameOf({ entity: c.entity }))}"></div>
-      <div class="row"><label class="lbl">Tile</label><select data-cam="${i}" data-field="tile_mode">${
-        [['', 'Card default'], ['snapshot', 'JPEG snapshot'], ['live', 'Live stream']].map(([v, n]) => `<option value="${v}"${(c.tile_mode || '') === v ? ' selected' : ''}>${n}</option>`).join('')}</select></div>
-      <div class="row"><label class="lbl">Snapshot every (s)</label><input type="number" min="0.5" step="0.5" data-cam="${i}" data-field="refresh_seconds" value="${esc(c.refresh_seconds ?? '')}" placeholder="card default"></div>
-      <div class="row"><label class="lbl">Tile fit</label><select data-cam="${i}" data-field="fit">${
-        [['', 'Card default'], ['cover', 'Fill tile (crop)'], ['contain', 'Whole picture'], ['fill', 'Stretch']].map(([v, n]) => `<option value="${v}"${(c.fit || '') === v ? ' selected' : ''}>${n}</option>`).join('')}</select></div>
-    </div>`).join('');
-    const fitOpts = [['cover', 'Fill (crop)'], ['contain', 'Whole picture'], ['fill', 'Stretch']];
-    const layout = (o, posOpts) => this._sel(`${o}.main_position`, 'Large pane', posOpts)
-      + this._num(`${o}.main_size`, 'Large pane size (%)', 10, 90)
-      + this._num(`${o}.columns`, 'Grid columns', 1, 12)
-      + this._num(`${o}.rows`, 'Grid rows', 0, 12, 1, '0 = as many as needed');
-    this.shadowRoot.innerHTML = `<style>${EDITOR_CSS}</style>
-      <datalist id="ecg-cams">${camIds.map((id) => `<option value="${esc(id)}"></option>`).join('')}</datalist>
-      ${this._panel('cameras', '📷 Cameras', `<div class="muted">The grid shows the cameras in this order. Each camera can have its own tile settings.</div>
-        ${camRows}<div class="row"><button data-add="1">+ Add camera</button></div>
-        ${this._sel('main_camera', 'Starts in the large pane', cams.map((c) => [c.entity, nameOf(c)]))}`)}
-      ${this._panel('tiles', '🧩 Tiles (defaults for every camera)', this._sel('tile_mode', 'Tile', [['snapshot', 'JPEG snapshot'], ['live', 'Live stream']])
-        + this._num('refresh_seconds', 'Snapshot every (s)', 0.5, 3600, 0.5)
-        + this._sel('tile_fit', 'Tile fit', fitOpts) + this._chk('show_names', 'Show camera names'))}
-      ${this._panel('main', '🎥 Large pane', this._sel('main_fit', 'Fit', fitOpts) + this._chk('muted', 'Muted')
-        + this._chk('show_main_name', 'Show name and LIVE badge')
-        + this._num('reset_after', 'Go back after (s)', 0, 86400, 1, 'no touch for this long → back to the start camera; 0 = off'))}
-      ${this._panel('layout', '📐 Layout', this._sel('orientation', 'Orientation', [['auto', 'Follow the screen'], ['landscape', 'Always landscape'], ['portrait', 'Always portrait']])
-        + `<div class="row"><label class="lbl">Height</label><input type="text" data-path="height" value="${esc(this._val('height'))}" placeholder="fill"><span class="muted">fill = rest of the screen, or 600px, 70vh</span></div>`
-        + this._num('gap', 'Gap (px)', 0, 40)
-        + '<h4>Landscape</h4>' + layout('landscape', [['left', 'Left'], ['right', 'Right']])
-        + '<h4>Portrait</h4>' + layout('portrait', [['top', 'Top'], ['bottom', 'Bottom']]))}
-      <div class="foot"><span>${BUILD_NUMBER}</span><a href="https://github.com/Ltek/easy-camera-grid-card" target="_blank" rel="noopener">⭐ Star on GitHub</a>
-        <a href="https://github.com/Ltek/easy-camera-grid-card/issues" target="_blank" rel="noopener">🐛 Report an issue</a></div>`;
+    this.innerHTML = `<style>${EDITOR_CSS}${EXTRA_EDITOR_CSS}</style>
+      <div class="ecge">
+        <datalist id="${ENTITY_LIST_ID}">${camIds.map((id) => `<option value="${esc(id)}"></option>`).join('')}</datalist>
+        ${this._panel('cameras', 'mdi:cctv', 'Cameras', this._camerasBody())}
+        ${this._panel('tiles', 'mdi:view-grid-outline', 'Grid tiles', this._tilesBody())}
+        ${this._panel('main', 'mdi:video-outline', 'Large pane', this._mainBody())}
+        ${this._panel('layout', 'mdi:page-layout-sidebar-left', 'Layout', this._layoutBody())}
+        <div class="ecge-links">
+          <a class="ecge-star" href="https://github.com/Ltek/easy-camera-grid-card" target="_blank" rel="noopener">⭐ Star on GitHub</a>
+          <a class="ecge-issue" href="https://github.com/Ltek/easy-camera-grid-card/issues" target="_blank" rel="noopener">🐛 Report an issue</a>
+        </div>
+        <div class="ecge-foot">Easy Camera Grid Card (Ltek) ${BUILD_NUMBER}</div>
+      </div>`;
+    this._rendered = true;
     this._wire();
+    if (focusSel) { const el = this.querySelector(focusSel); if (el) el.focus(); }
   }
 
   _wire() {
-    const R = this.shadowRoot, all = (s, f) => R.querySelectorAll(s).forEach(f);
-    all('details', (d) => d.addEventListener('toggle', () => { if (d.open) this._open.add(d.dataset.panel); else this._open.delete(d.dataset.panel); }));
-    all('[data-path]', (el) => el.addEventListener('change', () => {
-      let v = el.dataset.bool ? el.checked : el.value.trim();
-      if (el.dataset.num) v = v === '' ? '' : Number(v);
-      this._set(el.dataset.path, v);
+    const all = (sel, fn) => this.querySelectorAll(sel).forEach(fn);
+    all('details.ecge-sec, details.ecge-sub', (d) => d.addEventListener('toggle', () => {
+      if (d.open) this._open.add(d.dataset.panel); else this._open.delete(d.dataset.panel);
     }));
-    all('[data-cam]', (el) => el.addEventListener('change', () => {
-      const cams = this._cams(), c = cams[Number(el.dataset.cam)], f = el.dataset.field;
-      let v = el.value.trim();
-      if (f === 'refresh_seconds') v = v === '' ? '' : Number(v);
-      if (v === '') delete c[f]; else c[f] = v;
-      this._setCams(cams);
+    // plain fields: select / text
+    all('select[data-path], input[type="text"][data-path]', (el) => el.addEventListener('change', () => {
+      this._set(el.dataset.path, el.value.trim());
+      if (el.tagName === 'SELECT') this._render();
     }));
-    all('[data-move]', (el) => el.addEventListener('click', () => {
-      const cams = this._cams(), i = Number(el.dataset.move), j = i + Number(el.dataset.dir);
+    all('[data-bool]', (el) => el.addEventListener('change', () => this._set(el.dataset.bool, el.checked)));
+    // sliders: readout follows while dragging, the value is written on release
+    all('input[data-slider]', (el) => {
+      const path = el.dataset.slider;
+      const out = this.querySelector(`[data-val="${path}"]`);
+      const fmt = path === 'refresh_seconds' || path === 'reset_after' ? fmtSecs
+        : path.endsWith('main_size') ? (n) => `${n}%` : path === 'gap' ? (n) => `${n}px`
+          : path.endsWith('rows') ? (n) => (Number(n) ? String(n) : 'Auto') : String;
+      el.addEventListener('input', () => { if (out) out.textContent = fmt(Number(el.value)); });
+      el.addEventListener('change', () => { this._set(path, Number(el.value)); this._render(); });
+    });
+    all('[data-reset]', (b) => b.addEventListener('click', () => { this._set(b.dataset.reset, ''); this._render(); }));
+    all('[data-reset-on]', (el) => el.addEventListener('change', () => { this._set('reset_after', el.checked ? 120 : ''); this._render(); }));
+    all('[data-height-mode]', (el) => el.addEventListener('change', () => {
+      this._set('height', el.value === 'fill' ? '' : '600px'); this._render();
+    }));
+    // camera list
+    all('[data-add]', (b) => b.addEventListener('click', () => {
+      const cams = this._cams(), used = new Set(cams.map((c) => c.entity));
+      const next = Object.keys(this._hass?.states || {}).filter((id) => id.startsWith('camera.') && !used.has(id)).sort()[0] || 'camera.';
+      cams.push({ entity: next });
+      this._openCam.add(cams.length - 1);
+      this._saveCams(cams);
+    }));
+    all('[data-edit]', (b) => b.addEventListener('click', () => {
+      const i = Number(b.dataset.edit);
+      if (this._openCam.has(i)) this._openCam.delete(i); else this._openCam.add(i);
+      this._render();
+    }));
+    all('[data-move]', (b) => b.addEventListener('click', () => {
+      const cams = this._cams(), i = Number(b.dataset.move), j = i + Number(b.dataset.dir);
       if (j < 0 || j >= cams.length) return;
       [cams[i], cams[j]] = [cams[j], cams[i]];
-      this._setCams(cams);
+      const oi = this._openCam.has(i), oj = this._openCam.has(j);
+      this._openCam.delete(i); this._openCam.delete(j);
+      if (oi) this._openCam.add(j);
+      if (oj) this._openCam.add(i);
+      this._saveCams(cams);
     }));
-    all('[data-del]', (el) => el.addEventListener('click', () => {
-      const cams = this._cams(); cams.splice(Number(el.dataset.del), 1); this._setCams(cams);
+    all('[data-del]', (b) => b.addEventListener('click', () => {
+      const cams = this._cams(), i = Number(b.dataset.del);
+      cams.splice(i, 1);
+      this._openCam = new Set([...this._openCam].filter((k) => k !== i).map((k) => (k > i ? k - 1 : k)));
+      this._saveCams(cams);
     }));
-    all('[data-add]', (el) => el.addEventListener('click', () => {
-      const cams = this._cams(), used = new Set(cams.map((c) => c.entity));
-      const next = Object.keys(this._hass?.states || {}).find((id) => id.startsWith('camera.') && !used.has(id)) || 'camera.';
-      cams.push({ entity: next }); this._setCams(cams);
+    all('[data-cam]', (el) => {
+      const i = Number(el.dataset.cam), field = el.dataset.field;
+      if (el.type === 'range') {
+        const out = this.querySelector(`[data-cam-val="${i}"]`);
+        el.addEventListener('input', () => { if (out) out.textContent = fmtSecs(Number(el.value)); });
+      }
+      el.addEventListener('change', () => {
+        const cams = this._cams(), c = cams[i];
+        let v = el.value.trim();
+        if (field === 'refresh_seconds') v = Number(v);
+        if (v === '') delete c[field]; else c[field] = v;
+        if (field === 'entity' && !v) return;
+        this._saveCams(cams);
+      });
+    });
+    all('[data-cam-refresh]', (el) => el.addEventListener('change', () => {
+      const cams = this._cams(), c = cams[Number(el.dataset.camRefresh)];
+      if (el.checked) c.refresh_seconds = this._val('refresh_seconds'); else delete c.refresh_seconds;
+      this._saveCams(cams);
     }));
   }
+}
+
+function fmtSecs(n) {
+  n = Number(n);
+  if (n >= 60 && n % 60 === 0) return `${n / 60} min`;
+  if (n >= 60) return `${Math.floor(n / 60)}m ${n % 60}s`;
+  return `${n} s`;
 }
 
 // Test hooks (pure helpers; no effect in the browser)
 EasyCameraGridCard._test = {
   BUILD_NUMBER, VERSION, DEFAULTS, CARD_CSS, normalizeConfig, tileSettings, gridCameras, layoutFor,
-  resolveOrientation, snapshotUrl, camName, ensureStreamElement, tileMessage,
+  resolveOrientation, snapshotUrl, camName, ensureStreamElement, tileMessage, fmtSecs, VIEW,
 };
 
 if (!customElements.get(CARD_TAG)) customElements.define(CARD_TAG, EasyCameraGridCard);

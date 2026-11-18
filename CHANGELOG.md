@@ -1,5 +1,14 @@
 # Changelog
 
+## v2026.11.18.3
+
+- **Visual editor redone to the Ltek card design.** Four panels (Cameras, Grid tiles, Large pane, Layout) with the
+  same look as the other Ltek cards. Cameras are a list with ↑ ↓ ✏️ 🗑: ✏️ opens a camera's own name, tile, refresh
+  and fit. Sizes, columns, rows, gap and times are sliders. Landscape and Portrait each have their own sub-panel.
+  "Go back" is one checkbox with its time beside it.
+- Editing layout, refresh, fit or go-back no longer restarts the live stream in the preview; the camera you tapped
+  stays live when the editor rebuilds the card.
+
 ## v2026.11.18.2
 
 - A tile whose snapshot doesn't load now says **No picture** instead of staying blank, and keeps trying at its
