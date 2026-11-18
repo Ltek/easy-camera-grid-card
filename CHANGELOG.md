@@ -1,5 +1,11 @@
 # Changelog
 
+## v2026.11.18.4
+
+- Snapshot tiles no longer flash black on every refresh. The next picture is loaded and decoded off-screen and
+  swapped in when it's ready; the old one stays up until then. Each snapshot is also downloaded once instead of
+  twice.
+
 ## v2026.11.18.3
 
 - **Visual editor redone to the Ltek card design.** Four panels (Cameras, Grid tiles, Large pane, Layout) with the

@@ -1,5 +1,5 @@
 // Easy Camera Grid Card (Ltek) — Home Assistant Dashboard card: one large live camera + a grid of snapshots
-// Version: v2026.11.18.3
+// Version: v2026.11.18.4
 //
 // One camera plays live in the large pane (Home Assistant's own ha-camera-stream: WebRTC, HLS or MJPEG,
 // whatever the camera offers). Every other camera is a tile in the grid. A tile is a JPEG snapshot from
@@ -17,7 +17,7 @@
 // Vanilla JS, single file. The card stylesheet is a constant (no config values are interpolated into
 // it); per-card values are custom properties set inline on the card root. Names are escaped.
 
-const BUILD_NUMBER = 'v2026.11.18.3';
+const BUILD_NUMBER = 'v2026.11.18.4';
 const VERSION = BUILD_NUMBER.slice(1);
 const CARD_TAG = 'easy-camera-grid-card';
 const EDITOR_TAG = 'easy-camera-grid-card-editor';
@@ -311,7 +311,7 @@ class EasyCameraGridCard extends HTMLElement {
     el.dataset.entity = cam.entity;
     const s = tileSettings(this._config, cam);
     el.style.setProperty('--fit', s.fit);
-    el.innerHTML = `${s.mode === 'snapshot' ? '<img alt="" decoding="async">' : ''}<div class="msg"></div>${
+    el.innerHTML = `${s.mode === 'snapshot' ? '<img alt="">' : ''}<div class="msg"></div>${
       this._config.show_names ? '<div class="label"></div>' : ''}`;
     const t = { cam, el, img: el.querySelector('img'), msg: el.querySelector('.msg'), timer: null, busy: false, mode: s.mode, refresh: s.refresh, stream: null, failed: false };
     this._paintTile(t);
@@ -454,8 +454,16 @@ class EasyCameraGridCard extends HTMLElement {
     const next = () => { t.busy = false; if (this._visible && t.cam.entity !== this._mainId) t.timer = setTimeout(() => this._loadSnapshot(t), t.refresh * 1000); };
     if (!url) { next(); return; }
     t.busy = true;
+    // Load and decode the next picture off-screen, then swap the finished element in. The old picture
+    // stays up until then (no black frame), and the snapshot is downloaded once, not twice.
     const pre = new Image();
-    pre.onload = () => { t.img.src = url; this._setFailed(t, false); next(); };
+    pre.alt = '';
+    pre.onload = async () => {
+      try { if (typeof pre.decode === 'function') await pre.decode(); } catch (_e) { /* show it anyway */ }
+      if (t.img && t.img.parentNode) { t.img.replaceWith(pre); t.img = pre; }
+      this._setFailed(t, false);
+      next();
+    };
     pre.onerror = () => { this._setFailed(t, true); next(); };
     pre.src = url;
   }
